@@ -6,3 +6,6 @@ This repository contains an implementation of YOLOV3 models to be deployed on An
 3. download the repo as .zip file into your computer and link the path of the folder to the android SDK
 
 I have included in this repo a .ipynb file which shows you the steps to follow during training the yolov3 model and converting the model into .bp file
+
+
+Credit: https://github.com/TheSmike/pasm-yolov3-Android
