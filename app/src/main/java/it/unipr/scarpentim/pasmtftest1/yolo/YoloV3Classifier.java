@@ -1,0 +1,558 @@
+package it.unipr.scarpentim.pasmtftest1.yolo;
+
+import android.content.res.AssetManager;
+import android.graphics.Bitmap;
+import android.graphics.RectF;
+import android.os.Trace;
+import android.util.Log;
+import android.graphics.Color;
+import org.tensorflow.Operation;
+
+import org.tensorflow.contrib.android.TensorFlowInferenceInterface;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.PriorityQueue;
+
+import it.unipr.scarpentim.pasmtftest1.tensorflow.Classifier;
+
+/** An object detector that uses TF and a YOLO model to detect objects. */
+public class YoloV3Classifier implements Classifier {
+
+    // Only return this many results with at least this confidence.
+    private static final int MAX_RESULTS = 100;
+
+    private static final int NUM_CLASSES = 1;
+
+    private static final int NUM_BOXES_PER_BLOCK = 3 ;
+
+    private final static float OVERLAP_THRESHOLD = 0.25f;
+    public static final String FILE_ANDROID_ASSET = "file:///android_asset/";
+
+    private int[] anchors;
+    private String[] labels;
+
+    private static final String TAG = "PASM_yolov3";
+
+    // Config values.
+    private String inputName;
+    private int inputSize;
+
+    // Pre-allocated buffers.
+    private int[] intValues;
+    private float[] floatValues;
+    private String[] outputNames;
+
+    private int[] blockSize;
+    private int centerOffset;
+
+    private boolean logStats = false;
+
+    private TensorFlowInferenceInterface inferenceInterface;
+
+    /** Initializes a native TensorFlow session for classifying images. */
+    public static Classifier create(
+            final AssetManager assetManager,
+            final String modelName,
+            final int inputSize,
+            final String inputName,
+            final String outputName,
+            final int[] blockSize,
+            final int centerOffset) throws IOException {
+        YoloV3Classifier d = new YoloV3Classifier();
+        d.inputName = inputName;
+        d.inputSize = inputSize;
+
+        // Pre-allocate buffers.
+        d.outputNames = outputName.split(",");
+        d.intValues = new int[inputSize * inputSize];
+        d.floatValues = new float[inputSize * inputSize * 3];
+        d.blockSize = blockSize;
+
+        String modelFilename = modelName + ".bp";
+        String labelsFilename = modelName + "-labels.txt";
+        String anchorsFilename = modelName + "-anchors.txt";
+
+        //
+        d.inferenceInterface = new TensorFlowInferenceInterface(assetManager, FILE_ANDROID_ASSET + modelFilename);
+
+        InputStream labelsFile = assetManager.open(labelsFilename);
+        InputStream anchorsFile = assetManager.open(anchorsFilename);
+
+        d.labels = streamToLabels(labelsFile);
+        d.anchors = streamToAnchors(anchorsFile);
+
+        d.centerOffset = centerOffset;
+
+        return d;
+    }
+
+    private YoloV3Classifier() {}
+
+    @Override
+    public List<Recognition> recognizeImage(final Bitmap bitmap) {
+        long startNetwork = System.currentTimeMillis();
+        // Log this method so that it can be analyzed with systrace.
+        Trace.beginSection("recognizeImage");
+
+        Trace.beginSection("preprocessBitmap");
+        // Preprocess the image data from 0-255 int to normalized float based
+        // on the provided parameters.
+        bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
+        float imageMean = 128.0f;
+        float imageStd = 128.0f;
+
+        for (int i = 0; i < intValues.length; ++i) {
+            floatValues[i * 3 + 0] = ((intValues[i] >> 16) & 0xFF) / 255.0f;
+            floatValues[i * 3 + 1] = ((intValues[i] >> 8) & 0xFF) / 255.0f;
+            floatValues[i * 3 + 2] = (intValues[i] & 0xFF) / 255.0f;
+           // floatValues[i * 3 + 0] = (((intValues[i] >> 16) & 0xFF) - imageMean) / imageStd;
+           // floatValues[i * 3 + 1] = (((intValues[i] >> 8) & 0xFF) - imageMean) / imageStd;
+            //floatValues[i * 3 + 2] = ((intValues[i] & 0xFF) - imageMean) / imageStd;
+            // reverse the color orderings to BGR.
+            //floatValues[i*3 + 0] = Color.red(intValues[i])/255.0f;
+            //floatValues[i*3 + 1] = Color.green(intValues[i])/255.0f;
+            //floatValues[i*3 + 2] = Color.blue(intValues[i])/255.0f;
+        }
+        Trace.endSection(); // preprocessBitmap
+
+        // Copy the input data into TensorFlow.
+        Trace.beginSection("feed");
+        inferenceInterface.feed(inputName, floatValues, 1, inputSize, inputSize, 3);
+        Trace.endSection();
+
+        // Run the inference call.
+        Trace.beginSection("run");
+        inferenceInterface.run(outputNames, logStats);
+        Trace.endSection();
+        long endNetwork = System.currentTimeMillis();
+
+        long startProcessingOut = System.currentTimeMillis();
+        final ArrayList<Recognition> recognitions = new ArrayList<>();
+        for (int i = 0; i < blockSize.length; i++) {
+//            if (i != 1)
+//                continue;
+            // Copy the output Tensor back into the output array.
+            Trace.beginSection("fetch i");
+            int gridWidth = bitmap.getWidth() / blockSize[i];
+            int gridHeight = bitmap.getHeight() / blockSize[i];
+            final float[] output;
+
+            if(i==2) {
+                output= new float[(2 * gridWidth) * (2 * gridHeight) * (NUM_CLASSES + 5) * NUM_BOXES_PER_BLOCK];
+            }
+            else{
+                 output = new float[(gridWidth) * (gridHeight) * (NUM_CLASSES + 5) * NUM_BOXES_PER_BLOCK];
+
+            }
+            //Log.d(TAG,  String.format("mmmmmmmoutput0 size is............" + outputNames[i]));
+            Log.d(TAG,  String.format("mmmmmmmoutput0 size is --> %d * %d * (%d + 5) * %d = %d", gridWidth, gridHeight, NUM_CLASSES, NUM_BOXES_PER_BLOCK, gridWidth * gridHeight * (NUM_CLASSES + 5) * NUM_BOXES_PER_BLOCK ));
+
+
+
+                     //inferenceInterface.graph().operation(outputNames[i]).output(0).shape();
+            Log.i(TAG, "Read " + " labels, output layer size is " + inferenceInterface.graph().operation(outputNames[i]).output(0).shape());
+            inferenceInterface.fetch(outputNames[i], output);
+            Log.d(TAG,  String.format("mmmmmmmoutput0 size is............" + outputNames[i]));
+
+            Trace.endSection();
+
+            if (i==2) {
+                populateRecognitions(recognitions, bitmap, output, 104, 104, 4, i);
+            }
+            else {
+                populateRecognitions(recognitions, bitmap, output, gridWidth, gridHeight, blockSize[i], i);
+            }
+        }
+        long endProcessingOut = System.currentTimeMillis();
+        Trace.endSection(); // "recognizeImage"
+
+        Log.i(TAG, "       Network time = " + (endNetwork - startNetwork));
+        Log.i(TAG, "postprocessing time = " + (endProcessingOut - startProcessingOut));
+        return recognitions;
+    }
+
+    public float[][] fetch(final Bitmap bitmap) {
+        // Log this method so that it can be analyzed with systrace.
+        Trace.beginSection("recognizeImage");
+        Log.i(TAG, "       tttttttttttttttttttttttttttttttttttttttttt " );
+
+        Trace.beginSection("preprocessBitmap");
+        // Preprocess the image data from 0-255 int to normalized float based
+        // on the provided parameters.
+        bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
+       //how many channels yhe bitmap has????????????
+        for (int i = 0; i < intValues.length; ++i) {
+            floatValues[i * 3 + 0] = ((intValues[i] >> 16) & 0xFF) / 255.0f;
+            floatValues[i * 3 + 1] = ((intValues[i] >> 8) & 0xFF) / 255.0f;
+            floatValues[i * 3 + 2] = (intValues[i] & 0xFF) / 255.0f;
+        }
+        Trace.endSection(); // preprocessBitmap
+
+        // Copy the input data into TensorFlow.
+        Trace.beginSection("feed");
+        inferenceInterface.feed(inputName, floatValues, 1, inputSize, inputSize, 3);
+        Trace.endSection();
+
+        // Run the inference call.
+        Trace.beginSection("run");
+        inferenceInterface.run(outputNames, logStats);
+        Trace.endSection();
+
+        final float[][] finalOutput = new float[blockSize.length][];
+        for (int i = 0; i < blockSize.length; i++) {
+            if (i != 1)
+                continue;
+
+            // Copy the output Tensor back into the output array.
+            Trace.beginSection("fetch i");
+            int gridWidth = bitmap.getWidth() / blockSize[i];
+            int gridHeight = bitmap.getHeight() / blockSize[i];
+
+            final float[] output = new float[gridWidth * gridHeight * (NUM_CLASSES + 5) * NUM_BOXES_PER_BLOCK];
+            Log.d(TAG,  String.format("xxxxxxoutput0 size is --> %d * %d * (%d + 5) * %d = %d", gridWidth, gridHeight, NUM_CLASSES, NUM_BOXES_PER_BLOCK, gridWidth * gridHeight * (NUM_CLASSES + 5) * NUM_BOXES_PER_BLOCK ));
+            inferenceInterface.fetch(outputNames[i], output);
+            Trace.endSection();
+
+            finalOutput[i] = output;
+        }
+
+        Trace.endSection(); // "recognizeImage"
+
+        return finalOutput;
+    }
+
+
+    @Override
+    public void enableStatLogging(final boolean logStats) {
+        this.logStats = logStats;
+    }
+
+    @Override
+    public String getStatString() {
+        return inferenceInterface.getStatString();
+    }
+
+    @Override
+    public void close() {
+        inferenceInterface.close();
+    }
+
+    @Override
+    public String[] getLabels() {
+        return labels;
+    }
+
+    private void populateRecognitions(ArrayList<Recognition> recognitions, Bitmap bitmap, float[] networkOutput, int gridWidth, int gridHeight, int blockSize, int anchorOffset) {
+        // Find the best detections.
+        Log.i(TAG, "the total length of the network output is " + networkOutput.length );
+
+        final PriorityQueue<Recognition> pq =
+                new PriorityQueue<Recognition>(
+                        1,
+                        new Comparator<Recognition>() {
+                            @Override
+                            public int compare(final Recognition lhs, final Recognition rhs) {
+                                // Intentionally reversed to put high confidence at the head of the queue.
+                                return Float.compare(rhs.getConfidence(), lhs.getConfidence());
+                            }
+                        });
+
+        int y;
+        int x;
+        for (y = 0; y < gridHeight; ++y) {
+            for (x = 0; x < gridWidth; ++x) {
+                for (int b = 0; b < NUM_BOXES_PER_BLOCK; ++b) {
+                    final int offset =
+                            (gridWidth * (NUM_BOXES_PER_BLOCK * (NUM_CLASSES + 5))) * y
+                                    + (NUM_BOXES_PER_BLOCK * (NUM_CLASSES + 5)) * x
+                                    + (NUM_CLASSES + 5) * b;
+
+
+                    Log.i(TAG, "my network outputs  " + networkOutput[offset + 0] + networkOutput[offset + 1] + networkOutput[offset + 2]+networkOutput[offset + 3]);
+                    final float xPos = (x + centerOffset + expit(networkOutput[offset + 0])) * blockSize ;
+                    final float yPos = (y + centerOffset + expit(networkOutput[offset + 1])) * blockSize ;
+
+                    final float w = (float) (Math.exp(networkOutput[offset + 2]) * anchors[anchorOffset * 6 + 2 * b + 0]);
+                    final float h = (float) (Math.exp(networkOutput[offset + 3]) * anchors[anchorOffset * 6 + 2 * b + 1]);
+
+                    final RectF rect =
+                            new RectF(
+                                    Math.max(0, xPos - w / 2),
+                                    Math.max(0, yPos - h / 2),
+                                    Math.min(bitmap.getWidth() - 1, xPos + w / 2),
+                                    Math.min(bitmap.getHeight() - 1, yPos + h / 2));
+                    final float confidence = expit(networkOutput[offset + 4]);
+
+                    int detectedClass = -1;
+                    float maxClass = 0;
+
+                    final float[] classes = new float[NUM_CLASSES];
+                    for (int c = 0; c < NUM_CLASSES; ++c) {
+                        classes[c] = networkOutput[offset + 5 + c]; //percentage of each class
+                    }
+//                    softmax(classes);
+
+//                    for (int c = 0; c < NUM_CLASSES; ++c) {
+//                        if (classes[c] > maxClass) {
+//                            detectedClass = c;
+//                            maxClass = classes[c];
+//                        }
+//                    }
+//                    final float confidenceInClass = maxClass * confidence;
+//                    //if (confidenceInClass > 0.01) {
+//                        Log.v(TAG, String.format("%s (%d) %f %s", labels[detectedClass], detectedClass, confidenceInClass, rect));
+//                        pq.add(new Recognition("" + offset, labels[detectedClass], confidenceInClass, rect));
+//
+//                    //}
+
+
+//                    if (b != 0)
+//                        continue;
+                    for (int c = 0; c < NUM_CLASSES; c++) {
+                        final float confidenceInClass = classes[c] * confidence;
+                        if (confidenceInClass > 0.001) {
+                            Log.v(TAG, String.format("%s (%d) %f %s", labels[c], c, confidenceInClass, rect));
+                            pq.add(new Recognition("" + offset, labels[c], confidenceInClass, rect));
+                        }
+                    }
+
+                }
+            }
+        }
+
+        getRecognition(recognitions, pq);
+    }
+
+    public ArrayList<Recognition> debugAndTestpopulateRecognitions(float[][] networkOutputs, Bitmap bitmap) {
+
+        final ArrayList<Recognition> recognitions = new ArrayList<>();
+
+        for (int i = 0; i < networkOutputs.length; i++) {
+
+            if (i != 1)
+                continue;
+
+            int gridWidth = bitmap.getWidth() / blockSize[i];
+            int gridHeight = bitmap.getHeight() / blockSize[i];
+            int anchorOffset = i;
+            float[] networkOutput = networkOutputs[i];
+            int blockSize = this.blockSize[i];
+
+
+            // Find the best detections.
+            final PriorityQueue<Recognition> pq =
+                    new PriorityQueue<Recognition>(
+                            1,
+                            new Comparator<Recognition>() {
+                                @Override
+                                public int compare(final Recognition lhs, final Recognition rhs) {
+                                    // Intentionally reversed to put high confidence at the head of the queue.
+                                    return Float.compare(rhs.getConfidence(), lhs.getConfidence());
+                                }
+                            });
+
+            int y;
+            int x;
+            for (y = 0; y < gridHeight; ++y) {
+                for (x = 0; x < gridWidth; ++x) {
+                    for (int b = 0; b < NUM_BOXES_PER_BLOCK; ++b) {
+                        final int offset =
+                                (gridWidth * (NUM_BOXES_PER_BLOCK * (NUM_CLASSES + 5))) * y
+                                        + (NUM_BOXES_PER_BLOCK * (NUM_CLASSES + 5)) * x
+                                        + (NUM_CLASSES + 5) * b;
+
+                        final float xPos = (x + centerOffset + expit(networkOutput[offset + 0])) * blockSize;
+                        final float yPos = (y + centerOffset + expit(networkOutput[offset + 1])) * blockSize;
+
+                        final float w = (float) (Math.exp(networkOutput[offset + 2]) * anchors[anchorOffset * 6 + 2 * b + 0])* blockSize;
+                        final float h = (float) (Math.exp(networkOutput[offset + 3]) * anchors[anchorOffset * 6 + 2 * b + 1])* blockSize;
+
+                        final RectF rect =
+                                new RectF(
+                                        Math.max(0, xPos - w / 2),
+                                        Math.max(0, yPos - h / 2),
+                                        Math.min(bitmap.getWidth() - 1, xPos + w / 2),
+                                        Math.min(bitmap.getHeight() - 1, yPos + h / 2));
+                        final float confidence = expit(networkOutput[offset + 4]);
+
+                        int detectedClass = -1;
+                        float maxClass = 0;
+
+                        final float[] classes = new float[NUM_CLASSES];
+                        for (int c = 0; c < NUM_CLASSES; ++c) {
+                            classes[c] = networkOutput[offset + 5 + c]; //percentage of each class
+                        }
+                        //softmax(classes);
+
+    //                    for (int c = 0; c < NUM_CLASSES; ++c) {
+    //                        if (classes[c] > maxClass) {
+    //                            detectedClass = c;
+    //                            maxClass = classes[c];
+    //                        }
+    //                    }
+    //                    final float confidenceInClass = maxClass * confidence;
+    //                    //if (confidenceInClass > 0.01) {
+    //                        Log.v(TAG, String.format("%s (%d) %f %s", labels[detectedClass], detectedClass, confidenceInClass, rect));
+    //                        pq.add(new Recognition("" + offset, labels[detectedClass], confidenceInClass, rect));
+    //
+    //                    //}
+
+                        for (int c = 0; c < NUM_CLASSES; c++) {
+                            final float confidenceInClass = classes[c] * confidence;
+                            if (confidenceInClass > 0.0005 * (Math.pow(10,i))) {
+                                Log.v(TAG, String.format("%s (%d) %f %s", labels[c], c, confidenceInClass, rect));
+                                pq.add(new Recognition("" + offset, labels[c], confidenceInClass, rect));
+                            }
+                        }
+
+                    }
+                }
+            }
+            getRecognition(recognitions, pq);
+        }
+
+        return recognitions;
+
+    }
+
+    private List<Recognition> getRecognition(ArrayList<Recognition> recognitions, final PriorityQueue<Recognition> priorityQueue) {
+
+        if (priorityQueue.size() > 0) {
+            // Best recognition
+            Recognition bestRecognition = priorityQueue.poll();
+            recognitions.add(bestRecognition);
+            int i = 1;
+            while(i < MAX_RESULTS) {
+                //for (int i = 0; i < Math.min(priorityQueue.size(), MAX_RESULTS); ++i) {
+                Recognition recognition = priorityQueue.poll();
+                if (recognition == null)
+                    break;
+
+                boolean overlaps = false;
+                for (Recognition previousRecognition : recognitions) {
+                    if (previousRecognition.getTitle().equals( recognition.getTitle())) {
+//                        overlaps = overlaps || (getIntersectionProportion(previousRecognition.getLocation(),
+//                                recognition.getLocation()) > OVERLAP_THRESHOLD);
+                        overlaps = overlaps || iou(previousRecognition.getLocation(), recognition.getLocation()) > OVERLAP_THRESHOLD;
+                    }
+                }
+
+                if (!overlaps) {
+                    recognitions.add(recognition);
+                    i++;
+                }
+
+//              tmp //commentami
+//                Recognition recognition = priorityQueue.poll();
+//                if (recognition == null)
+//                    break;
+//                recognitions.add(recognition);
+
+
+            }
+        }
+
+        return recognitions;
+    }
+
+    private double iou(RectF box1, RectF box2){
+        float int_x0 = Math.max(box1.left, box2.left);
+        float int_y0 = Math.max(box1.top, box2.top);
+        float int_x1 = Math.min(box1.right, box2.right);
+        float int_y1 = Math.min(box1.bottom, box2.bottom);
+
+        float int_area = (int_x1 - int_x0) * (int_y1 - int_y0);
+
+        float box1_area = (box1.right - box1.left) * (box1.bottom - box1.top);
+        float box2_area = (box2.right - box2.left) * (box2.bottom - box2.top);
+
+        double iou = int_area / (box1_area + box2_area - int_area + 1e-05);
+        return iou;
+    }
+
+    private float getIntersectionProportion(RectF primaryShape, RectF secondaryShape) {
+        if (overlaps(primaryShape, secondaryShape)) {
+            float intersectionSurface = Math.max(0, Math.min(primaryShape.right, secondaryShape.right) - Math.max(primaryShape.left, secondaryShape.left)) *
+                    Math.max(0, Math.min(primaryShape.bottom, secondaryShape.bottom) - Math.max(primaryShape.top, secondaryShape.top));
+
+            float surfacePrimary = Math.abs(primaryShape.right - primaryShape.left) * Math.abs(primaryShape.bottom - primaryShape.top);
+
+            return intersectionSurface / surfacePrimary;
+        }
+
+        return 0f;
+    }
+
+    private boolean overlaps(RectF primary, RectF secondary) {
+        return primary.left < secondary.right && primary.right > secondary.left
+                && primary.top < secondary.bottom && primary.bottom > secondary.top;
+    }
+
+    private static int[] streamToAnchors(InputStream anchorsFile) throws IOException {
+        List<Integer> labels = new ArrayList<>();
+
+        // read it with BufferedReader
+        BufferedReader br = new BufferedReader(new InputStreamReader(anchorsFile));
+
+        String line;
+        while ((line = br.readLine()) != null) {
+            String[] split = line.split(",");
+            for (String s : split) {
+                labels.add(Integer.valueOf(s.trim()));
+            }
+        }
+
+        br.close();
+
+        int[] ints = new int[labels.size()];
+        for (int i = 0; i < labels.size(); i++) {
+            ints[i] = labels.get(i);
+        }
+
+        return ints;
+    }
+
+    private static String[] streamToLabels(InputStream labelsFile) throws IOException {
+
+        List<String> labels = new ArrayList<>();
+
+        // read it with BufferedReader
+        BufferedReader br = new BufferedReader(new InputStreamReader(labelsFile));
+
+        String line;
+        while ((line = br.readLine()) != null) {
+            labels.add(line);
+        }
+
+        br.close();
+
+        return labels.toArray(new String[0]);
+    }
+
+
+    private float expit(final float x) {
+        return (float) (1. / (1. + Math.exp(-x)));
+    }
+
+    private void softmax(final float[] vals) {
+        float max = Float.NEGATIVE_INFINITY;
+        for (final float val : vals) {
+            max = Math.max(max, val);
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < vals.length; ++i) {
+            vals[i] = (float) Math.exp(vals[i] - max);
+            sum += vals[i];
+        }
+        for (int i = 0; i < vals.length; ++i) {
+            vals[i] = vals[i] / sum;
+        }
+    }
+
+}

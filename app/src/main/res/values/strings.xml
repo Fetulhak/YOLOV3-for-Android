@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">TB Diagnosis APP </string>
+    <string name="action_OpenGallery">Open Gallery</string>
+    <string name="action_OpenCamera">Come back to Camera</string>
+    <string name="captured_image">Captured Image</string>
+    <string name="preview_from_gallery">preview from gallery</string>
+    <string name="classify">Detect</string>
+    <string name="press_button">Pres the button</string>
+</resources>
